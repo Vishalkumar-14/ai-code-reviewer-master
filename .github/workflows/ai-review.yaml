@@ -1,0 +1,102 @@
+# Dogfood: MeroReviewer reviews itself!
+# This workflow runs our own AI code review tool on PRs to this repository
+
+name: MeroReviewer
+
+on:
+  pull_request:
+    # `synchronize` (re-run on every push) deliberately omitted to control
+    # cost — a review fires on PR open / reopen / draft→ready, not on each
+    # push. Re-trigger a review by toggling draft or via workflow_dispatch.
+    types: [opened, reopened, ready_for_review]
+    # Doc-only PRs are owned by the `Doc Auto-Update` workflow; skipping
+    # them here avoids paying twice for the same diff.
+    paths-ignore:
+      - 'docs/**'
+      - 'architecture/**'
+      - 'docs-static/**'
+  # Allow manual trigger for testing
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number to review'
+        required: true
+        type: number
+      agents:
+        description: 'Number of agents (1-5)'
+        required: false
+        default: '3'
+        type: choice
+        options:
+          - '1'
+          - '2'
+          - '3'
+          - '4'
+          - '5'
+
+# Prevent race conditions: only one review per PR at a time
+concurrency:
+  group: ai-review-${{ github.event.pull_request.number || github.event.inputs.pr_number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    # Don't run on draft PRs
+    if: github.event.pull_request.draft == false || github.event_name == 'workflow_dispatch'
+
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for better context
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: 'pip'
+
+      - name: Install AI Code Reviewer (from local)
+        run: |
+          pip install -e .
+          ai-reviewer --version
+
+      - name: Determine PR number
+        id: pr
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "number=${{ github.event.inputs.pr_number }}" >> $GITHUB_OUTPUT
+            echo "agents=${{ github.event.inputs.agents }}" >> $GITHUB_OUTPUT
+          else
+            echo "number=${{ github.event.pull_request.number }}" >> $GITHUB_OUTPUT
+            # Default to 1 agent for cost; bump via workflow_dispatch when needed.
+            echo "agents=1" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run AI Code Review
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          # Use GH_PAT for full features (thread resolution), fallback to GITHUB_TOKEN
+          GITHUB_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          echo "🔍 Reviewing PR #${{ steps.pr.outputs.number }} with ${{ steps.pr.outputs.agents }} agent(s)..."
+          ai-reviewer review-pr \
+            ${{ github.repository }} \
+            ${{ steps.pr.outputs.number }} \
+            --agents ${{ steps.pr.outputs.agents }} \
+            --reviewer-name "MeroReviewer" \
+            --output github
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## AI Code Review" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "🤖 Reviewed PR #${{ steps.pr.outputs.number }} using ${{ steps.pr.outputs.agents }} agent(s)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Check the PR comments for the full review." >> $GITHUB_STEP_SUMMARY

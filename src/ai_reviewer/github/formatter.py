@@ -1,0 +1,543 @@
+"""GitHub comment formatter for review output."""
+
+from __future__ import annotations
+
+from ai_reviewer.github.client import ReviewDelta, ReviewMeta
+from ai_reviewer.models.findings import Severity
+from ai_reviewer.models.review import ConsolidatedReview
+
+
+class GitHubFormatter:
+    """Formats review output for GitHub comments."""
+
+    SEVERITY_EMOJI = {
+        Severity.CRITICAL: "🔴",
+        Severity.WARNING: "🟡",
+        Severity.SUGGESTION: "💡",
+        Severity.NITPICK: "📝",
+    }
+
+    SEVERITY_LABEL = {
+        Severity.CRITICAL: "Critical",
+        Severity.WARNING: "Warning",
+        Severity.SUGGESTION: "Suggestion",
+        Severity.NITPICK: "Nitpick",
+    }
+
+    def __init__(self, reviewer_name: str = "AI Code Reviewer") -> None:
+        """Initialize the formatter.
+
+        Args:
+            reviewer_name: Custom name to display in review header
+        """
+        self.reviewer_name = reviewer_name
+
+    def format_review(self, review: ConsolidatedReview, meta: ReviewMeta | None = None) -> str:
+        """Format a consolidated review as a GitHub comment.
+
+        Args:
+            review: Consolidated review to format
+            meta: Optional review metadata to embed for cross-run tracking
+
+        Returns:
+            Markdown formatted comment
+        """
+        lines = [
+            f"## 🤖 {self.reviewer_name}",
+            "",
+            self._format_header(review),
+            "",
+            "---",
+            "",
+        ]
+
+        if not review.findings:
+            lines.extend(
+                [
+                    "### ✅ No Issues Found",
+                    "",
+                    "All agents reviewed the code and found no issues. LGTM! 🎉",
+                    "",
+                ]
+            )
+        else:
+            # Group by severity
+            by_severity = self._group_findings_by_severity(review.findings)
+
+            for severity in [
+                Severity.CRITICAL,
+                Severity.WARNING,
+                Severity.SUGGESTION,
+                Severity.NITPICK,
+            ]:
+                findings = by_severity.get(severity, [])
+                if findings:
+                    lines.extend(
+                        self._format_severity_section(severity, findings, review.agent_count)
+                    )
+                    lines.append("")
+
+        lines.extend(
+            [
+                "---",
+                "",
+                self._format_footer(review, meta),
+            ]
+        )
+
+        return "\n".join(lines)
+
+    def format_review_compact(
+        self,
+        review: ConsolidatedReview,
+        meta: ReviewMeta | None = None,
+        inline_findings: list | None = None,
+    ) -> str:
+        """Format a minimal top-level body when inline comments are posted.
+
+        Use this when posting findings as inline comments so the PR-level
+        comment stays short; details live on the code.
+        """
+        header = self._format_header(review)
+        findings_for_inline = review.findings if inline_findings is None else inline_findings
+        if not findings_for_inline:
+            body = "✅ No issues found. LGTM!"
+        else:
+            by_sev = self._count_findings_by_severity(findings_for_inline)
+            parts = []
+            if by_sev.get(Severity.CRITICAL, 0) > 0:
+                parts.append(f"🔴 {by_sev[Severity.CRITICAL]} critical")
+            if by_sev.get(Severity.WARNING, 0) > 0:
+                parts.append(f"🟡 {by_sev[Severity.WARNING]} warnings")
+            if by_sev.get(Severity.SUGGESTION, 0) > 0:
+                parts.append(f"💡 {by_sev[Severity.SUGGESTION]} suggestions")
+            if by_sev.get(Severity.NITPICK, 0) > 0:
+                parts.append(f"📝 {by_sev[Severity.NITPICK]} nitpicks")
+            body = (
+                (", ".join(parts) + ". See inline comments.") if parts else "See inline comments."
+            )
+        return "\n".join(
+            [
+                f"## 🤖 {self.reviewer_name}",
+                "",
+                header,
+                "",
+                body,
+                "",
+                "---",
+                "",
+                self._format_footer(review, meta),
+            ]
+        )
+
+    def format_review_with_delta_compact(
+        self,
+        review: ConsolidatedReview,
+        delta: ReviewDelta,
+        meta: ReviewMeta | None = None,
+        inline_new_findings: list | None = None,
+    ) -> str:
+        """Format a minimal top-level body when inline comments are posted (with delta)."""
+        header = self._format_header(review)
+        if delta.all_issues_resolved:
+            body = "✅ All issues resolved. Ready to merge!"
+        else:
+            new_findings = (
+                delta.new_findings if inline_new_findings is None else inline_new_findings
+            )
+            parts = []
+            if delta.fixed_findings:
+                parts.append(f"✅ {len(delta.fixed_findings)} fixed")
+            if new_findings:
+                parts.append(f"🆕 {len(new_findings)} new")
+            if delta.open_findings:
+                parts.append(f"⏳ {len(delta.open_findings)} open")
+            body = (
+                (" | ".join(parts) + ". See inline comments.") if parts else "See inline comments."
+            )
+        suppressed_line = self._format_suppressed_line(delta)
+        content = [
+            f"## 🤖 {self.reviewer_name}",
+            "",
+            header,
+            "",
+            body,
+        ]
+        if suppressed_line:
+            content.append(suppressed_line)
+        content.extend(
+            [
+                "",
+                "---",
+                "",
+                self._format_footer(review, meta),
+            ]
+        )
+        return "\n".join(content)
+
+    def _format_header(self, review: ConsolidatedReview) -> str:
+        """Format the review header."""
+        consensus_pct = int(review.review_quality_score * 100)
+        time_sec = review.total_review_time_ms / 1000
+
+        if review.id == "lgtm-fast-path":
+            return f"**All previous comments resolved** | Quality score: {consensus_pct}%"
+
+        return (
+            f"**Reviewed by {review.agent_count} agents** | "
+            f"Quality score: {consensus_pct}% | "
+            f"Review time: {time_sec:.1f}s"
+        )
+
+    def _format_severity_section(
+        self, severity: Severity, findings: list, agent_count: int
+    ) -> list[str]:
+        """Format a section for a severity level."""
+        emoji = self.SEVERITY_EMOJI[severity]
+        label = self.SEVERITY_LABEL[severity]
+
+        lines = [
+            f"### {emoji} {label} ({len(findings)})",
+            "",
+        ]
+
+        for i, finding in enumerate(findings, 1):
+            # Consensus indicator
+            consensus_count = len(finding.agreeing_agents)
+            consensus_str = f"{consensus_count}/{agent_count} agents"
+            if consensus_count == agent_count:
+                consensus_str += " ✓"
+
+            lines.extend(
+                [
+                    f"#### {i}. {finding.title}",
+                    f"**File:** `{finding.file_path}` (line {finding.line_start}"
+                    + (f"-{finding.line_end}" if finding.line_end else "")
+                    + f") | **Consensus:** {consensus_str}",
+                    "",
+                    finding.description,
+                    "",
+                ]
+            )
+
+            if finding.suggested_fix:
+                lines.extend(
+                    [
+                        "**Suggested fix:**",
+                        "```",
+                        finding.suggested_fix,
+                        "```",
+                        "",
+                    ]
+                )
+
+            # Show which agents found this (for transparency)
+            agents_str = ", ".join(finding.agreeing_agents[:3])
+            if len(finding.agreeing_agents) > 3:
+                agents_str += f" (+{len(finding.agreeing_agents) - 3} more)"
+            lines.append(f"> *Found by: {agents_str}*")
+            lines.append("")
+
+        return lines
+
+    def _format_footer(self, review: ConsolidatedReview, meta: ReviewMeta | None = None) -> str:
+        """Format the review footer, optionally embedding review metadata."""
+        footer = (
+            f"<sub>🤖 Generated by "
+            f"[{self.reviewer_name}](https://github.com/calimero-network/ai-code-reviewer) | "
+            f"Review ID: `{review.id}`</sub>"
+        )
+        if meta is not None:
+            footer += "\n" + meta.to_html_comment()
+        return footer
+
+    def format_review_with_delta(
+        self,
+        review: ConsolidatedReview,
+        delta: ReviewDelta,
+        meta: ReviewMeta | None = None,
+    ) -> str:
+        """Format a review showing changes from previous run.
+
+        Args:
+            review: Current consolidated review
+            delta: Changes from previous review
+            meta: Optional review metadata to embed for cross-run tracking
+
+        Returns:
+            Markdown formatted comment with status indicators
+        """
+        lines = [
+            f"## 🤖 {self.reviewer_name}",
+            "",
+            self._format_header(review),
+            "",
+        ]
+
+        # Add status summary banner
+        lines.extend(self._format_status_banner(delta))
+        lines.extend(["", "---", ""])
+
+        # Show FIXED issues first (good news!)
+        if delta.fixed_findings:
+            lines.extend(self._format_fixed_section(delta.fixed_findings))
+            lines.append("")
+
+        # Show NEW issues (need attention)
+        if delta.new_findings:
+            lines.extend(self._format_new_findings_section(delta.new_findings, review.agent_count))
+            lines.append("")
+
+        # Show OPEN issues (still pending)
+        if delta.open_findings:
+            lines.extend(
+                self._format_open_findings_section(delta.open_findings, review.agent_count)
+            )
+            lines.append("")
+
+        # If nothing to show
+        if not delta.new_findings and not delta.open_findings and not delta.fixed_findings:
+            lines.extend(
+                [
+                    "### ✅ No Issues Found",
+                    "",
+                    "All agents reviewed the code and found no issues. LGTM! 🎉",
+                    "",
+                ]
+            )
+
+        suppressed_line = self._format_suppressed_line(delta)
+        if suppressed_line:
+            lines.append(suppressed_line)
+            lines.append("")
+
+        lines.extend(
+            [
+                "---",
+                "",
+                self._format_footer(review, meta),
+            ]
+        )
+
+        return "\n".join(lines)
+
+    @staticmethod
+    def _format_suppressed_line(delta: ReviewDelta) -> str:
+        """Return a short note about suppressed findings, or empty string if none."""
+        n = len(delta.suppressed_findings)
+        if n == 0:
+            return ""
+        noun = "finding" if n == 1 else "findings"
+        return f"*{n} low-severity {noun} suppressed on recently-fixed code.*"
+
+    def _format_status_banner(self, delta: ReviewDelta) -> list[str]:
+        """Format the status summary banner."""
+        if delta.all_issues_resolved:
+            return [
+                "### ✅ Ready to Merge",
+                "",
+                "All previously identified issues have been addressed!",
+            ]
+
+        new_count = len(delta.new_findings)
+        fixed_count = len(delta.fixed_findings)
+        open_count = len(delta.open_findings)
+
+        # Status icons
+        parts = []
+        if fixed_count > 0:
+            parts.append(f"✅ **{fixed_count} Fixed**")
+        if new_count > 0:
+            parts.append(f"🆕 **{new_count} New**")
+        if open_count > 0:
+            parts.append(f"⏳ **{open_count} Open**")
+
+        status_line = " | ".join(parts)
+
+        # Determine overall status
+        has_critical = any(
+            f.severity.value == "critical" for f in delta.new_findings + delta.open_findings
+        )
+
+        if has_critical:
+            status_icon = "🔴"
+            status_text = "Critical issues require attention"
+        elif new_count > 0 or open_count > 0:
+            status_icon = "🟡"
+            status_text = "Issues pending resolution"
+        else:
+            status_icon = "✅"
+            status_text = "Ready to merge"
+
+        return [
+            f"### {status_icon} {status_text}",
+            "",
+            status_line,
+        ]
+
+    def _format_fixed_section(self, fixed_findings: list) -> list[str]:
+        """Format the section showing fixed issues."""
+        lines = [
+            "### ✅ Fixed Issues",
+            "",
+            "<details>",
+            "<summary>The following issues from previous reviews have been addressed:</summary>",
+            "",
+        ]
+
+        for i, finding in enumerate(fixed_findings, 1):
+            lines.append(f"{i}. ~~{finding.title}~~ (`{finding.file_path}:{finding.line}`)")
+
+        lines.extend(["", "</details>"])
+        return lines
+
+    def _format_new_findings_section(self, findings: list, agent_count: int) -> list[str]:
+        """Format section for NEW findings."""
+        lines = [
+            "### 🆕 New Issues",
+            "",
+            "*These issues were found in the latest changes:*",
+            "",
+        ]
+
+        # Group by severity
+        by_severity = self._group_findings_by_severity(findings)
+
+        for severity in [
+            Severity.CRITICAL,
+            Severity.WARNING,
+            Severity.SUGGESTION,
+            Severity.NITPICK,
+        ]:
+            sev_findings = by_severity.get(severity, [])
+            if sev_findings:
+                lines.extend(self._format_severity_section(severity, sev_findings, agent_count))
+
+        return lines
+
+    def _format_open_findings_section(self, findings: list, agent_count: int) -> list[str]:
+        """Format section for OPEN (still unresolved) findings."""
+        lines = [
+            "### ⏳ Open Issues",
+            "",
+            "*These issues from previous reviews are still present:*",
+            "",
+        ]
+
+        # Group by severity
+        by_severity = self._group_findings_by_severity(findings)
+
+        for severity in [
+            Severity.CRITICAL,
+            Severity.WARNING,
+            Severity.SUGGESTION,
+            Severity.NITPICK,
+        ]:
+            sev_findings = by_severity.get(severity, [])
+            if sev_findings:
+                lines.extend(self._format_severity_section(severity, sev_findings, agent_count))
+
+        return lines
+
+    def _group_findings_by_severity(self, findings: list) -> dict:
+        """Group findings by severity."""
+        groups: dict = {}
+        for finding in findings:
+            if finding.severity not in groups:
+                groups[finding.severity] = []
+            groups[finding.severity].append(finding)
+        return groups
+
+    def _count_findings_by_severity(self, findings: list) -> dict[Severity, int]:
+        """Count findings by severity for compact summaries."""
+        counts: dict[Severity, int] = dict.fromkeys(Severity, 0)
+        for finding in findings:
+            counts[finding.severity] += 1
+        return counts
+
+    def get_review_action_with_delta(
+        self,
+        review: ConsolidatedReview,
+        delta: ReviewDelta,
+        allow_approve: bool = True,
+    ) -> str:
+        """Determine GitHub review action considering the delta.
+
+        LGTM-with-comments: REQUEST_CHANGES only for critical findings. When there are
+        only warnings, suggestions, or nitpicks, returns COMMENT so the author isn't blocked.
+
+        Args:
+            review: Consolidated review
+            delta: Review delta
+            allow_approve: Whether to allow APPROVE action (also controls REQUEST_CHANGES)
+
+        Returns:
+            GitHub review action
+        """
+        if delta.all_issues_resolved and allow_approve:
+            return "APPROVE"
+
+        # Block merge only when there are critical findings (not warnings/suggestions/nitpicks)
+        has_critical = any(
+            f.severity.value == "critical" for f in delta.new_findings + delta.open_findings
+        )
+        if has_critical and allow_approve:
+            return "REQUEST_CHANGES"
+
+        # No critical: COMMENT (includes only nits/suggestions/warnings — don't block author)
+        return "COMMENT"
+
+    def get_review_action(self, review: ConsolidatedReview, allow_approve: bool = True) -> str:
+        """Determine the GitHub review action based on findings.
+
+        LGTM-with-comments: REQUEST_CHANGES only for critical findings. When there are
+        only warnings, suggestions, or nitpicks, returns COMMENT so the author isn't blocked.
+
+        Args:
+            review: Consolidated review
+            allow_approve: Whether to allow APPROVE/REQUEST_CHANGES actions
+                          (False in GitHub Actions to avoid blocking merges)
+
+        Returns:
+            GitHub review action: "APPROVE", "REQUEST_CHANGES", or "COMMENT"
+        """
+        if not review.findings and allow_approve:
+            return "APPROVE"
+        # Block merge only on critical; warnings/suggestions/nitpicks → COMMENT
+        if review.has_critical_issues and allow_approve:
+            return "REQUEST_CHANGES"
+        return "COMMENT"
+
+
+def format_review_as_json(review: ConsolidatedReview) -> dict:
+    """Format review as JSON-serializable dict."""
+    return {
+        "review_id": review.id,
+        "created_at": review.created_at.isoformat(),
+        "repo": review.repo,
+        "pr_number": review.pr_number,
+        "summary": review.summary,
+        "quality_score": review.review_quality_score,
+        "agent_count": review.agent_count,
+        "total_time_ms": review.total_review_time_ms,
+        "findings": [
+            {
+                "id": f.id,
+                "file_path": f.file_path,
+                "line_start": f.line_start,
+                "line_end": f.line_end,
+                "severity": f.severity.value,
+                "category": f.category.value,
+                "title": f.title,
+                "description": f.description,
+                "suggested_fix": f.suggested_fix,
+                "consensus_score": f.consensus_score,
+                "agreeing_agents": f.agreeing_agents,
+                "confidence": f.confidence,
+            }
+            for f in review.findings
+        ],
+        "findings_by_severity": {
+            k.value: v for k, v in review.findings_by_severity.items() if v > 0
+        },
+    }
