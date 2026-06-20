@@ -1,4 +1,4 @@
-# AI Code Reviewer
+# Code Review Crew
 
 **Multi-agent code review system that orchestrates multiple LLMs to produce comprehensive, consensus-based code reviews.**
 
